@@ -186,16 +186,19 @@ void weighted_similarity_compare(
         weight_t norm_v2   = weight_t{0};
         weight_t v1_dot_v2 = weight_t{0};
 
+        std::for_each(graph_wgt_first + v1_begin, graph_wgt_first + v1_end, [&norm_v1](auto w) {
+          norm_v1 += static_cast<weight_t>(w) * static_cast<weight_t>(w);
+        });
+
+        std::for_each(graph_wgt_first + v2_begin, graph_wgt_first + v2_end, [&norm_v2](auto w) {
+          norm_v2 += static_cast<weight_t>(w) * static_cast<weight_t>(w);
+        });
+
         std::for_each(
           thrust::make_zip_iterator(intersected_weights_v1.begin(), intersected_weights_v2.begin()),
           thrust::make_zip_iterator(intersected_weights_v1.end(), intersected_weights_v2.end()),
-          [&norm_v1, &norm_v2, &v1_dot_v2](cuda::std::tuple<weight_t, weight_t> w1_w2) {
-            auto x = cuda::std::get<0>(w1_w2);
-            auto y = cuda::std::get<1>(w1_w2);
-
-            norm_v1 += x * x;
-            norm_v2 += y * y;
-            v1_dot_v2 += x * y;
+          [&v1_dot_v2](cuda::std::tuple<weight_t, weight_t> w1_w2) {
+            v1_dot_v2 += cuda::std::get<0>(w1_w2) * cuda::std::get<1>(w1_w2);
           });
 
         auto expected_score = test_functor.compute_score(
@@ -276,11 +279,11 @@ void similarity_compare(
           << "score mismatch, got " << score << ", expected " << expected_score;
 
       } else {
-        auto expected_score =
-          test_functor.compute_score(weight_t{1},
-                                     weight_t{1},
-                                     intersection.size() >= 1 ? weight_t{1} : weight_t{0},
-                                     weight_t{1});
+        auto expected_score = test_functor.compute_score(
+          std::sqrt(static_cast<weight_t>(vertex_degrees[v1])),
+          std::sqrt(static_cast<weight_t>(vertex_degrees[v2])),
+          static_cast<weight_t>(std::distance(intersection.begin(), intersection_end)),
+          weight_t{1});
 
         EXPECT_TRUE(compare_functor(score, expected_score))
           << "score mismatch, got " << score << ", expected " << expected_score;

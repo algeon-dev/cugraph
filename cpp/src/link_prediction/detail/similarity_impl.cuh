@@ -77,8 +77,25 @@ rmm::device_uvector<weight_t> similarity(
 
   if (edge_weight_view) {
     rmm::device_uvector<weight_t> similarity_score(num_vertex_pairs, handle.get_stream());
-    rmm::device_uvector<weight_t> weighted_out_degrees =
-      compute_out_weight_sums(handle, graph_view, *edge_weight_view);
+    // Cosine normalizes by the L2 norm of each endpoint's full neighborhood weight vector, so it
+    // needs per-vertex sums of squared weights; the other coefficients use plain weight sums.
+    rmm::device_uvector<weight_t> vertex_weight_sums(0, handle.get_stream());
+    if (coeff == coefficient_t::COSINE) {
+      vertex_weight_sums.resize(graph_view.local_vertex_partition_range_size(),
+                                handle.get_stream());
+      per_v_transform_reduce_outgoing_e(
+        handle,
+        graph_view,
+        edge_src_dummy_property_t{}.view(),
+        edge_dst_dummy_property_t{}.view(),
+        *edge_weight_view,
+        [] __device__(vertex_t, vertex_t, auto, auto, weight_t w) { return w * w; },
+        weight_t{0},
+        reduce_op::plus<weight_t>{},
+        vertex_weight_sums.data());
+    } else {
+      vertex_weight_sums = compute_out_weight_sums(handle, graph_view, *edge_weight_view);
+    }
 
     per_v_pair_transform_dst_nbr_intersection(
       handle,
@@ -86,7 +103,7 @@ rmm::device_uvector<weight_t> similarity(
       *edge_weight_view,
       vertex_pairs_begin,
       vertex_pairs_begin + num_vertex_pairs,
-      weighted_out_degrees.begin(),
+      vertex_weight_sums.begin(),
       [coeff,
        j = jaccard_functor_t<weight_t>{},
        s = sorensen_functor_t<weight_t>{},
@@ -99,31 +116,22 @@ rmm::device_uvector<weight_t> similarity(
                                                     auto intersected_properties_a,
                                                     auto intersected_properties_b) {
         if (coeff == coefficient_t::COSINE) {
-          weight_t norm_a                    = weight_t{0};
-          weight_t norm_b                    = weight_t{0};
-          weight_t sum_of_product_of_a_and_b = weight_t{0};
-
+          // weight_a and weight_b are the sums of squared weights over each full neighborhood.
           auto pair_first = thrust::make_zip_iterator(intersected_properties_a.data(),
                                                       intersected_properties_b.data());
-          cuda::std::tie(norm_a, norm_b, sum_of_product_of_a_and_b) = thrust::transform_reduce(
+          weight_t sum_of_product_of_a_and_b = thrust::transform_reduce(
             thrust::seq,
             pair_first,
             pair_first + intersected_properties_a.size(),
             [] __device__(auto property_pair) {
-              auto prop_a = cuda::std::get<0>(property_pair);
-              auto prop_b = cuda::std::get<1>(property_pair);
-              return cuda::std::make_tuple(prop_a * prop_a, prop_b * prop_b, prop_a * prop_b);
+              return cuda::std::get<0>(property_pair) * cuda::std::get<1>(property_pair);
             },
-            cuda::std::make_tuple(weight_t{0}, weight_t{0}, weight_t{0}),
-            [] __device__(auto lhs, auto rhs) {
-              return cuda::std::make_tuple(cuda::std::get<0>(lhs) + cuda::std::get<0>(rhs),
-                                           cuda::std::get<1>(lhs) + cuda::std::get<1>(rhs),
-                                           cuda::std::get<2>(lhs) + cuda::std::get<2>(rhs));
-            });
+            weight_t{0},
+            cuda::std::plus<weight_t>{});
 
-          return c.compute_score(static_cast<weight_t>(sqrt(norm_a)),
-                                 static_cast<weight_t>(sqrt(norm_b)),
-                                 static_cast<weight_t>(sum_of_product_of_a_and_b),
+          return c.compute_score(static_cast<weight_t>(sqrt(weight_a)),
+                                 static_cast<weight_t>(sqrt(weight_b)),
+                                 sum_of_product_of_a_and_b,
                                  weight_t{1.0});
 
         } else {
@@ -205,9 +213,9 @@ rmm::device_uvector<weight_t> similarity(
                                                     auto,
                                                     auto) {
         if (coeff == coefficient_t::COSINE) {
-          return c.compute_score(weight_t{1},
-                                 weight_t{1},
-                                 intersection.size() >= 1 ? weight_t{1} : weight_t{0},
+          return c.compute_score(static_cast<weight_t>(sqrt(static_cast<weight_t>(v1_degree))),
+                                 static_cast<weight_t>(sqrt(static_cast<weight_t>(v2_degree))),
+                                 static_cast<weight_t>(intersection.size()),
                                  weight_t{1});
         } else {
           if (coeff == coefficient_t::JACCARD) {
