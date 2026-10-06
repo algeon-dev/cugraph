@@ -725,6 +725,9 @@ std::pair<std::unique_ptr<Dendrogram<vertex_t>>, weight_t> leiden(
  *                                    Called theta in the Leiden algorithm.
  * communities. (default 1)
  *
+ * @p graph_view must be symmetric. Every returned cluster induces a connected subgraph: after the
+ * last level, each cluster is split into the connected components of its intra-cluster edges.
+ *
  * @return                           a pair containing:
  *                                     1) number of levels of the returned clustering
  *                                     2) modularity of the returned clustering

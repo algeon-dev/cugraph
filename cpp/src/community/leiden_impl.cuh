@@ -8,8 +8,14 @@
 #include "community/detail/refine.hpp"
 #include "community/flatten_dendrogram.hpp"
 
+#include <cugraph/algorithms.hpp>
 #include <cugraph/detail/utility_wrappers.hpp>
+#include <cugraph/edge_property.hpp>
+#include <cugraph/edge_src_dst_property.hpp>
 #include <cugraph/graph.hpp>
+#include <cugraph/graph_functions.hpp>
+#include <cugraph/prims/make_initialized_edge_property.cuh>
+#include <cugraph/prims/transform_e.cuh>
 #include <cugraph/prims/update_edge_src_dst_property.cuh>
 #include <cugraph/shuffle_functions.hpp>
 #include <cugraph/utilities/high_res_timer.hpp>
@@ -20,6 +26,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/functional>
 #include <cuda/std/iterator>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
@@ -71,7 +78,7 @@ template <typename vertex_t,
           typename weight_t,
           bool multi_gpu,
           bool store_transposed = false>
-std::pair<std::unique_ptr<Dendrogram<vertex_t>>, weight_t> leiden(
+std::unique_ptr<Dendrogram<vertex_t>> leiden(
   raft::handle_t const& handle,
   raft::random::RngState& rng_state,
   graph_view_t<vertex_t, edge_t, false, multi_gpu> const& graph_view,
@@ -95,8 +102,6 @@ std::pair<std::unique_ptr<Dendrogram<vertex_t>>, weight_t> leiden(
 #ifdef TIMING
   HighResTimer hr_timer{};
 #endif
-
-  weight_t final_Q{-1};
 
   weight_t total_edge_weight =
     compute_total_edge_weight(handle, current_graph_view, *current_edge_weight_view);
@@ -429,16 +434,6 @@ std::pair<std::unique_ptr<Dendrogram<vertex_t>>, weight_t> leiden(
     }
 
     // Clear buffer and contract the graph
-    final_Q = detail::compute_modularity(handle,
-                                         current_graph_view,
-                                         current_edge_weight_view,
-                                         src_louvain_assignment_cache,
-                                         dst_louvain_assignment_cache,
-                                         louvain_assignment_for_vertices,
-                                         cluster_weights,
-                                         total_edge_weight,
-                                         resolution);
-
     cluster_keys.resize(0, handle.get_stream());
     cluster_weights.resize(0, handle.get_stream());
     vertex_weights.resize(0, handle.get_stream());
@@ -601,7 +596,7 @@ std::pair<std::unique_ptr<Dendrogram<vertex_t>>, weight_t> leiden(
   detail::timer_display<graph_view_t::is_multi_gpu>(handle, hr_timer, std::cout);
 #endif
 
-  return std::make_pair(std::move(dendrogram), final_Q);
+  return dendrogram;
 }
 
 template <typename vertex_t, bool multi_gpu>
@@ -661,6 +656,92 @@ void flatten_leiden_dendrogram(raft::handle_t const& handle,
     handle, dendrogram, vertex_ids_v.data(), clustering, dendrogram.num_levels());
 }
 
+// Splits every community of a flat partition into the connected components of the subgraph its
+// members induce. A level that terminates early keeps its unrefined Louvain assignment, and the
+// GPU refinement can itself leave a community disconnected (arXiv 2402.11454), so the split is what
+// guarantees connected communities on every exit path, including the max_level cap. Splitting a
+// disconnected community never lowers modularity: no edge joins its parts, so the intra-community
+// weight is unchanged and the squared degree sum can only shrink.
+template <typename vertex_t, typename edge_t, bool multi_gpu>
+void split_disconnected_communities(
+  raft::handle_t const& handle,
+  graph_view_t<vertex_t, edge_t, false, multi_gpu> const& graph_view,
+  vertex_t* clustering)
+{
+  edge_src_property_t<vertex_t, vertex_t> src_clusters(handle);
+  edge_dst_property_t<vertex_t, vertex_t> dst_clusters(handle);
+  if constexpr (multi_gpu) {
+    src_clusters = edge_src_property_t<vertex_t, vertex_t>(handle, graph_view);
+    dst_clusters = edge_dst_property_t<vertex_t, vertex_t>(handle, graph_view);
+    update_edge_src_property(handle, graph_view, clustering, src_clusters.mutable_view());
+    update_edge_dst_property(handle, graph_view, clustering, dst_clusters.mutable_view());
+  }
+  auto const local_vertex_count = graph_view.local_vertex_partition_range_size();
+  auto src_cluster_view =
+    multi_gpu ? src_clusters.view()
+              : make_edge_src_property_view<vertex_t, vertex_t>(
+                  graph_view, clustering, static_cast<size_t>(local_vertex_count));
+  auto dst_cluster_view =
+    multi_gpu ? dst_clusters.view()
+              : make_edge_dst_property_view<vertex_t, vertex_t>(
+                  graph_view, clustering, static_cast<size_t>(local_vertex_count));
+
+  auto intra_community_edges = make_initialized_edge_property(handle, graph_view, false);
+  transform_e(handle,
+              graph_view,
+              src_cluster_view,
+              dst_cluster_view,
+              edge_dummy_property_t{}.view(),
+              cuda::proclaim_return_type<bool>(
+                [] __device__(auto, auto, auto src_cluster, auto dst_cluster, auto) {
+                  return src_cluster == dst_cluster;
+                }),
+              intra_community_edges.mutable_view());
+
+  // Both directions of an undirected edge share the endpoint clusters, so the mask stays
+  // symmetric, which weakly connected components requires.
+  auto intra_community_view = graph_view;
+  intra_community_view.attach_edge_mask(intra_community_edges.view());
+  weakly_connected_components(handle, intra_community_view, clustering, false);
+}
+
+// Modularity of a flat partition of the original graph, computed with the same formula the
+// Leiden levels use.
+template <typename vertex_t, typename edge_t, typename weight_t, bool multi_gpu>
+weight_t partition_modularity(raft::handle_t const& handle,
+                              graph_view_t<vertex_t, edge_t, false, multi_gpu> const& graph_view,
+                              edge_property_view_t<edge_t, weight_t const*> edge_weight_view,
+                              vertex_t const* clustering,
+                              weight_t resolution)
+{
+  rmm::device_uvector<vertex_t> clusters(graph_view.local_vertex_partition_range_size(),
+                                         handle.get_stream());
+  raft::copy(clusters.data(), clustering, clusters.size(), handle.get_stream());
+
+  edge_src_property_t<vertex_t, vertex_t> src_clusters(handle);
+  edge_dst_property_t<vertex_t, vertex_t> dst_clusters(handle);
+  if constexpr (multi_gpu) {
+    src_clusters = edge_src_property_t<vertex_t, vertex_t>(handle, graph_view);
+    dst_clusters = edge_dst_property_t<vertex_t, vertex_t>(handle, graph_view);
+    update_edge_src_property(handle, graph_view, clusters.begin(), src_clusters.mutable_view());
+    update_edge_dst_property(handle, graph_view, clusters.begin(), dst_clusters.mutable_view());
+  }
+
+  auto weights = std::make_optional(edge_weight_view);
+  auto [cluster_keys, cluster_weights] =
+    compute_cluster_keys_and_values(handle, graph_view, weights, clusters, src_clusters);
+
+  return compute_modularity(handle,
+                            graph_view,
+                            weights,
+                            src_clusters,
+                            dst_clusters,
+                            clusters,
+                            cluster_weights,
+                            compute_total_edge_weight(handle, graph_view, edge_weight_view),
+                            resolution);
+}
+
 }  // namespace detail
 
 template <typename vertex_t, typename edge_t, typename weight_t, bool multi_gpu>
@@ -671,12 +752,21 @@ std::pair<std::unique_ptr<Dendrogram<vertex_t>>, weight_t> leiden(
   std::optional<edge_property_view_t<edge_t, weight_t const*>> edge_weight_view,
   size_t max_level,
   weight_t resolution,
-  weight_t theta = 1.0)
+  weight_t theta)
 {
   CUGRAPH_EXPECTS(!graph_view.has_edge_mask(), "unimplemented.");
+  CUGRAPH_EXPECTS(edge_weight_view.has_value(), "Graph must be weighted");
 
-  return detail::leiden(
-    handle, rng_state, graph_view, edge_weight_view, max_level, resolution, theta);
+  auto dendrogram =
+    detail::leiden(handle, rng_state, graph_view, edge_weight_view, max_level, resolution, theta);
+
+  rmm::device_uvector<vertex_t> clustering(graph_view.local_vertex_partition_range_size(),
+                                           handle.get_stream());
+  detail::flatten_leiden_dendrogram(handle, graph_view, *dendrogram, clustering.data());
+  auto modularity = detail::partition_modularity(
+    handle, graph_view, *edge_weight_view, clustering.data(), resolution);
+
+  return std::make_pair(std::move(dendrogram), modularity);
 }
 
 template <typename vertex_t, typename edge_t, bool multi_gpu>
@@ -699,20 +789,22 @@ std::pair<size_t, weight_t> leiden(
   vertex_t* clustering,
   size_t max_level,
   weight_t resolution,
-  weight_t theta = 1.0)
+  weight_t theta)
 {
   CUGRAPH_EXPECTS(!graph_view.has_edge_mask(), "unimplemented.");
+  CUGRAPH_EXPECTS(graph_view.is_symmetric(),
+                  "Invalid input argument: Leiden requires a symmetric (undirected) graph.");
 
   CUGRAPH_EXPECTS(edge_weight_view.has_value(), "Graph must be weighted");
   detail::check_clustering(graph_view, clustering);
 
-  std::unique_ptr<Dendrogram<vertex_t>> dendrogram;
-  weight_t modularity;
-
-  std::tie(dendrogram, modularity) =
+  auto dendrogram =
     detail::leiden(handle, rng_state, graph_view, edge_weight_view, max_level, resolution, theta);
 
   detail::flatten_leiden_dendrogram(handle, graph_view, *dendrogram, clustering);
+  detail::split_disconnected_communities(handle, graph_view, clustering);
+  auto modularity =
+    detail::partition_modularity(handle, graph_view, *edge_weight_view, clustering, resolution);
 
   size_t local_num_verts = (*dendrogram).get_level_size_nocheck(0);
   rmm::device_uvector<vertex_t> unique_cluster_ids(local_num_verts, handle.get_stream());
