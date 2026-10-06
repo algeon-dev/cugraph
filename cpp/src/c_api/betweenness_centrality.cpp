@@ -106,7 +106,7 @@ struct betweenness_centrality_functor : public cugraph::c_api::abstract_functor 
             graph_view.local_vertex_partition_range_last(),
             do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
 
@@ -218,7 +218,7 @@ struct edge_betweenness_centrality_functor : public cugraph::c_api::abstract_fun
             graph_view.local_vertex_partition_range_last(),
             do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
 

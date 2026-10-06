@@ -248,7 +248,7 @@ struct bfs_functor : public abstract_functor {
       }
 
       if (invalid_count != 0) {
-        mark_error(CUGRAPH_INVALID_INPUT, "Found invalid vertex in the input sources");
+        mark_error(CUGRAPH_INVALID_INPUT, "BFS sources contain a vertex that is not in the graph");
         return;
       }
 
@@ -374,7 +374,7 @@ struct bfs_predicate_functor : public abstract_functor {
         handle_, sources_, graph_view, *number_map, do_expensive_check_);
 
       if (count_invalid_vertices<vertex_t, multi_gpu>(handle_, sources) != 0) {
-        mark_error(CUGRAPH_INVALID_INPUT, "Found invalid vertex in the input sources");
+        mark_error(CUGRAPH_INVALID_INPUT, "BFS sources contain a vertex that is not in the graph");
         return;
       }
 

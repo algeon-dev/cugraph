@@ -149,7 +149,7 @@ struct pagerank_functor : public cugraph::c_api::abstract_functor {
             graph_view.local_vertex_partition_range_last(),
             do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
       }
@@ -182,7 +182,7 @@ struct pagerank_functor : public cugraph::c_api::abstract_functor {
               weight_t{0},
               do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
       }
@@ -215,7 +215,7 @@ struct pagerank_functor : public cugraph::c_api::abstract_functor {
               weight_t{0},
               do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
       }

@@ -110,6 +110,12 @@ struct sssp_functor : public abstract_functor {
                                                  do_expensive_check_);
 
       raft::update_host(&src, source_ids.data(), 1, handle_.get_stream());
+      handle_.sync_stream();
+
+      if (src == cugraph::invalid_vertex_id<vertex_t>::value) {
+        mark_error(CUGRAPH_INVALID_INPUT, "SSSP source vertex is not in the graph");
+        return;
+      }
 
       cugraph::sssp<vertex_t, edge_t, weight_t, multi_gpu>(
         handle_,

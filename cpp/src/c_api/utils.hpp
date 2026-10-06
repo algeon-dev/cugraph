@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -7,9 +7,12 @@
 #include "c_api/graph.hpp"
 #include "c_api/error.hpp"
 
+#include <cugraph/utilities/error.hpp>
+
 #include <rmm/error.hpp>
 
 #include <new>
+#include <stdexcept>
 #include <utility>
 
 // The cuDF shim owns this exception type and installs this public C++ header
@@ -73,6 +76,15 @@ cugraph_error_code_t run_with_error_boundary(operation_t&& operation,
     *error = cugraph::c_api::make_allocation_error(
       ex.what(), CUGRAPH_ALLOCATION_SOURCE_STD_BAD_ALLOC);
     return CUGRAPH_ALLOC_ERROR;
+  } catch (cugraph::logic_error const& ex) {
+    // CUGRAPH_EXPECTS and CUGRAPH_FAIL state a precondition of the call. The reason omits the
+    // source location and call stack that what() carries, so the caller can be shown it.
+    *error =
+      reinterpret_cast<::cugraph_error_t*>(new cugraph::c_api::cugraph_error_t{ex.reason()});
+    return CUGRAPH_INVALID_INPUT;
+  } catch (std::invalid_argument const& ex) {
+    *error = reinterpret_cast<::cugraph_error_t*>(new cugraph::c_api::cugraph_error_t{ex.what()});
+    return CUGRAPH_INVALID_INPUT;
   } catch (std::exception const& ex) {
     *error = reinterpret_cast<::cugraph_error_t*>(new cugraph::c_api::cugraph_error_t{ex.what()});
     return CUGRAPH_UNKNOWN_ERROR;

@@ -117,7 +117,7 @@ struct similarity_functor : public cugraph::c_api::abstract_functor {
           graph_view.local_vertex_partition_range_last(),
           false);
       } catch (cugraph::logic_error const& ex) {
-        mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+        mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
         return;
       }
 
@@ -131,7 +131,7 @@ struct similarity_functor : public cugraph::c_api::abstract_functor {
                                            raft::device_span<vertex_t const>{v2.data(), v2.size()}),
                            do_expensive_check_));
       } catch (cugraph::logic_error const& ex) {
-        mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+        mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
         return;
       }
 
@@ -230,7 +230,7 @@ struct all_pairs_similarity_functor : public cugraph::c_api::abstract_functor {
             graph_view.local_vertex_partition_range_last(),
             do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
       }
@@ -250,7 +250,7 @@ struct all_pairs_similarity_functor : public cugraph::c_api::abstract_functor {
           topk_ != SIZE_MAX ? std::make_optional(topk_) : std::nullopt,
           do_expensive_check_));
       } catch (cugraph::logic_error const& ex) {
-        mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+        mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
         return;
       }
       auto& [v1, v2, similarity_coefficients] = *similarity_result;
