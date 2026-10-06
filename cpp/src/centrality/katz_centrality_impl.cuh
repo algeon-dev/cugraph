@@ -29,7 +29,7 @@ namespace cugraph {
 namespace detail {
 
 template <typename GraphViewType, typename weight_t, typename result_t>
-void katz_centrality(
+centrality_algorithm_metadata_t katz_centrality_allow_nonconvergence(
   raft::handle_t const& handle,
   GraphViewType const& pull_graph_view,
   std::optional<edge_property_view_t<typename GraphViewType::edge_type, weight_t const*>>
@@ -54,7 +54,7 @@ void katz_centrality(
                 "GraphViewType should support the pull model.");
 
   auto const num_vertices = pull_graph_view.number_of_vertices();
-  if (num_vertices == 0) { return; }
+  if (num_vertices == 0) { return centrality_algorithm_metadata_t{0, true}; }
 
   // 1. check input arguments
 
@@ -91,6 +91,7 @@ void katz_centrality(
   auto new_katz_centralities = katz_centralities;
   auto old_katz_centralities = tmp_katz_centralities.data();
   size_t iter{0};
+  bool converged{false};
   while (true) {
     std::swap(new_katz_centralities, old_katz_centralities);
 
@@ -150,10 +151,10 @@ void katz_centrality(
     iter++;
 
     if (diff_sum < epsilon) {
+      converged = true;
       break;
-    } else if (iter >= max_iterations) {
-      CUGRAPH_FAIL("Katz Centrality failed to converge.");
     }
+    if (iter >= max_iterations) { break; }
   }
 
   if (new_katz_centralities != katz_centralities) {
@@ -163,7 +164,9 @@ void katz_centrality(
                  katz_centralities);
   }
 
-  if (normalize) {
+  // A diverging run (alpha above 1/lambda_max) can end with non-finite values, which have no
+  // L2 norm, so only a converged result is normalized.
+  if (normalize && converged) {
     auto l2_norm = transform_reduce_v(
       handle,
       pull_graph_view,
@@ -179,9 +182,40 @@ void katz_centrality(
                       katz_centralities,
                       [l2_norm] __device__(auto val) { return val / l2_norm; });
   }
+
+  return centrality_algorithm_metadata_t{iter, converged};
 }
 
 }  // namespace detail
+
+template <typename vertex_t, typename edge_t, typename weight_t, typename result_t, bool multi_gpu>
+centrality_algorithm_metadata_t katz_centrality_allow_nonconvergence(
+  raft::handle_t const& handle,
+  graph_view_t<vertex_t, edge_t, true, multi_gpu> const& graph_view,
+  std::optional<edge_property_view_t<edge_t, weight_t const*>> edge_weight_view,
+  result_t const* betas,
+  result_t* katz_centralities,
+  result_t alpha,
+  result_t beta,  // relevant only if beta == nullptr
+  result_t epsilon,
+  size_t max_iterations,
+  bool has_initial_guess,
+  bool normalize,
+  bool do_expensive_check)
+{
+  return detail::katz_centrality_allow_nonconvergence(handle,
+                                                      graph_view,
+                                                      edge_weight_view,
+                                                      betas,
+                                                      katz_centralities,
+                                                      alpha,
+                                                      beta,
+                                                      epsilon,
+                                                      max_iterations,
+                                                      has_initial_guess,
+                                                      normalize,
+                                                      do_expensive_check);
+}
 
 template <typename vertex_t, typename edge_t, typename weight_t, typename result_t, bool multi_gpu>
 void katz_centrality(raft::handle_t const& handle,
@@ -197,18 +231,19 @@ void katz_centrality(raft::handle_t const& handle,
                      bool normalize,
                      bool do_expensive_check)
 {
-  detail::katz_centrality(handle,
-                          graph_view,
-                          edge_weight_view,
-                          betas,
-                          katz_centralities,
-                          alpha,
-                          beta,
-                          epsilon,
-                          max_iterations,
-                          has_initial_guess,
-                          normalize,
-                          do_expensive_check);
+  auto metadata = cugraph::katz_centrality_allow_nonconvergence(handle,
+                                                                graph_view,
+                                                                edge_weight_view,
+                                                                betas,
+                                                                katz_centralities,
+                                                                alpha,
+                                                                beta,
+                                                                epsilon,
+                                                                max_iterations,
+                                                                has_initial_guess,
+                                                                normalize,
+                                                                do_expensive_check);
+  CUGRAPH_EXPECTS(metadata.converged_, "Katz Centrality failed to converge.");
 }
 
 }  // namespace cugraph

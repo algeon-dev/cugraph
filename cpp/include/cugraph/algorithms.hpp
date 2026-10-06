@@ -1542,6 +1542,27 @@ std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
                                   bool do_expensive_check);
 
 /**
+ * @brief Compute HITS scores, reporting non-convergence instead of throwing.
+ *
+ * Takes the arguments of hits(). When the returned metadata is not converged, @p hubs and
+ * @p authorities hold the scores of the last iteration.
+ *
+ * @return A tuple of the sum of the differences of hub scores of the last two iterations and the
+ * iteration count with the convergence flag
+ */
+template <typename vertex_t, typename edge_t, typename result_t, bool multi_gpu>
+std::tuple<result_t, centrality_algorithm_metadata_t> hits_allow_nonconvergence(
+  raft::handle_t const& handle,
+  graph_view_t<vertex_t, edge_t, true, multi_gpu> const& graph_view,
+  result_t* hubs,
+  result_t* authorities,
+  result_t epsilon,
+  size_t max_iterations,
+  bool has_initial_hubs_guess,
+  bool normalize,
+  bool do_expensive_check);
+
+/**
 .* @ingroup centrality_cpp
  * @brief Compute Katz Centrality scores.
  *
@@ -1593,6 +1614,31 @@ void katz_centrality(raft::handle_t const& handle,
                      bool has_initial_guess  = false,
                      bool normalize          = false,
                      bool do_expensive_check = false);
+
+/**
+ * @brief Compute Katz Centrality scores, reporting non-convergence instead of throwing.
+ *
+ * Takes the arguments of katz_centrality(). When the returned metadata is not converged,
+ * @p katz_centralities holds the last iteration without normalization: an @p alpha above the
+ * inverse of the largest adjacency eigenvalue makes the iteration diverge, so the values can be
+ * non-finite.
+ *
+ * @return The iteration count and the convergence flag
+ */
+template <typename vertex_t, typename edge_t, typename weight_t, typename result_t, bool multi_gpu>
+centrality_algorithm_metadata_t katz_centrality_allow_nonconvergence(
+  raft::handle_t const& handle,
+  graph_view_t<vertex_t, edge_t, true, multi_gpu> const& graph_view,
+  std::optional<edge_property_view_t<edge_t, weight_t const*>> edge_weight_view,
+  result_t const* betas,
+  result_t* katz_centralities,
+  result_t alpha,
+  result_t beta,
+  result_t epsilon,
+  size_t max_iterations   = 500,
+  bool has_initial_guess  = false,
+  bool normalize          = false,
+  bool do_expensive_check = false);
 
 /**
 .* @ingroup community_cpp

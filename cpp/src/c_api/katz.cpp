@@ -113,19 +113,20 @@ struct katz_functor : public cugraph::c_api::abstract_functor {
             do_expensive_check_);
       }
 
-      cugraph::katz_centrality<vertex_t, edge_t, weight_t, weight_t, multi_gpu>(
-        handle_,
-        graph_view,
-        (edge_weights != nullptr) ? std::make_optional(edge_weights->view()) : std::nullopt,
-        betas_ == nullptr ? nullptr : betas.data(),
-        centralities.data(),
-        static_cast<weight_t>(alpha_),
-        static_cast<weight_t>(beta_),
-        static_cast<weight_t>(epsilon_),
-        max_iterations_,
-        false,
-        true,
-        do_expensive_check_);
+      auto metadata =
+        cugraph::katz_centrality_allow_nonconvergence<vertex_t, edge_t, weight_t, weight_t, multi_gpu>(
+          handle_,
+          graph_view,
+          (edge_weights != nullptr) ? std::make_optional(edge_weights->view()) : std::nullopt,
+          betas_ == nullptr ? nullptr : betas.data(),
+          centralities.data(),
+          static_cast<weight_t>(alpha_),
+          static_cast<weight_t>(beta_),
+          static_cast<weight_t>(epsilon_),
+          max_iterations_,
+          false,
+          true,
+          do_expensive_check_);
 
       rmm::device_uvector<vertex_t> vertex_ids(graph_view.local_vertex_partition_range_size(),
                                                handle_.get_stream());
@@ -133,7 +134,9 @@ struct katz_functor : public cugraph::c_api::abstract_functor {
 
       result_ = new cugraph::c_api::cugraph_centrality_result_t{
         new cugraph::c_api::cugraph_type_erased_device_array_t(vertex_ids, graph_->vertex_type_),
-        new cugraph::c_api::cugraph_type_erased_device_array_t(centralities, graph_->weight_type_)};
+        new cugraph::c_api::cugraph_type_erased_device_array_t(centralities, graph_->weight_type_),
+        metadata.number_of_iterations_,
+        metadata.converged_};
     }
   }
 };
@@ -141,6 +144,31 @@ struct katz_functor : public cugraph::c_api::abstract_functor {
 }  // namespace
 
 extern "C" cugraph_error_code_t cugraph_katz_centrality(
+  const cugraph_resource_handle_t* handle,
+  cugraph_graph_t* graph,
+  const cugraph_type_erased_device_array_view_t* betas,
+  double alpha,
+  double beta,
+  double epsilon,
+  size_t max_iterations,
+  bool_t do_expensive_check,
+  cugraph_centrality_result_t** result,
+  cugraph_error_t** error)
+{
+  katz_functor functor(
+    handle, graph, nullptr, alpha, beta, epsilon, max_iterations, do_expensive_check);
+
+  auto return_value = cugraph::c_api::run_algorithm(graph, functor, result, error);
+  if (return_value != CUGRAPH_SUCCESS) { return return_value; }
+  if (cugraph_centrality_result_converged(*result) != bool_t::TRUE) {
+    cugraph_centrality_result_free(*result);
+    *result = nullptr;
+    CAPI_EXPECTS(false, CUGRAPH_UNKNOWN_ERROR, "Katz Centrality failed to converge.", *error);
+  }
+  return return_value;
+}
+
+extern "C" cugraph_error_code_t cugraph_katz_centrality_allow_nonconvergence(
   const cugraph_resource_handle_t* handle,
   cugraph_graph_t* graph,
   const cugraph_type_erased_device_array_view_t* betas,

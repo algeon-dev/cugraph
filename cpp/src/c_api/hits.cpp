@@ -26,6 +26,7 @@ struct cugraph_hits_result_t {
   cugraph_type_erased_device_array_t* authorities_;
   double hub_score_differences_;
   size_t number_of_iterations_;
+  bool converged_;
 };
 
 }  // namespace c_api
@@ -101,7 +102,7 @@ struct hits_functor : public cugraph::c_api::abstract_functor {
       rmm::device_uvector<weight_t> authorities(graph_view.local_vertex_partition_range_size(),
                                                 handle_.get_stream());
       weight_t hub_score_differences{0};
-      size_t number_of_iterations{0};
+      cugraph::centrality_algorithm_metadata_t metadata{};
 
       if (initial_hubs_guess_vertices_ != nullptr) {
         rmm::device_uvector<vertex_t> guess_vertices(initial_hubs_guess_vertices_->size_,
@@ -130,13 +131,13 @@ struct hits_functor : public cugraph::c_api::abstract_functor {
               weight_t{0},
               do_expensive_check_);
         } catch (cugraph::logic_error const& ex) {
-          mark_error(CUGRAPH_INVALID_INPUT, ex.what());
+          mark_error(CUGRAPH_INVALID_INPUT, ex.reason());
           return;
         }
       }
 
-      std::tie(hub_score_differences, number_of_iterations) =
-        cugraph::hits<vertex_t, edge_t, weight_t, multi_gpu>(
+      std::tie(hub_score_differences, metadata) =
+        cugraph::hits_allow_nonconvergence<vertex_t, edge_t, weight_t, multi_gpu>(
           handle_,
           graph_view,
           hubs.data(),
@@ -156,7 +157,8 @@ struct hits_functor : public cugraph::c_api::abstract_functor {
         new cugraph::c_api::cugraph_type_erased_device_array_t(hubs, graph_->weight_type_),
         new cugraph::c_api::cugraph_type_erased_device_array_t(authorities, graph_->weight_type_),
         hub_score_differences,
-        number_of_iterations};
+        metadata.number_of_iterations_,
+        metadata.converged_};
     }
   }
 };
@@ -199,6 +201,12 @@ extern "C" size_t cugraph_hits_result_get_number_of_iterations(cugraph_hits_resu
   return internal_pointer->number_of_iterations_;
 }
 
+extern "C" bool_t cugraph_hits_result_converged(cugraph_hits_result_t* result)
+{
+  auto internal_pointer = reinterpret_cast<cugraph::c_api::cugraph_hits_result_t*>(result);
+  return internal_pointer->converged_ ? bool_t::TRUE : bool_t::FALSE;
+}
+
 extern "C" void cugraph_hits_result_free(cugraph_hits_result_t* result)
 {
   auto internal_pointer = reinterpret_cast<cugraph::c_api::cugraph_hits_result_t*>(result);
@@ -209,6 +217,37 @@ extern "C" void cugraph_hits_result_free(cugraph_hits_result_t* result)
 }
 
 extern "C" cugraph_error_code_t cugraph_hits(
+  const cugraph_resource_handle_t* handle,
+  cugraph_graph_t* graph,
+  double epsilon,
+  size_t max_iterations,
+  const cugraph_type_erased_device_array_view_t* initial_hubs_guess_vertices,
+  const cugraph_type_erased_device_array_view_t* initial_hubs_guess_values,
+  bool_t normalize,
+  bool_t do_expensive_check,
+  cugraph_hits_result_t** result,
+  cugraph_error_t** error)
+{
+  hits_functor functor(handle,
+                       graph,
+                       epsilon,
+                       max_iterations,
+                       initial_hubs_guess_vertices,
+                       initial_hubs_guess_values,
+                       normalize,
+                       do_expensive_check);
+
+  auto return_value = cugraph::c_api::run_algorithm(graph, functor, result, error);
+  if (return_value != CUGRAPH_SUCCESS) { return return_value; }
+  if (cugraph_hits_result_converged(*result) != bool_t::TRUE) {
+    cugraph_hits_result_free(*result);
+    *result = nullptr;
+    CAPI_EXPECTS(false, CUGRAPH_UNKNOWN_ERROR, "HITS failed to converge.", *error);
+  }
+  return return_value;
+}
+
+extern "C" cugraph_error_code_t cugraph_hits_allow_nonconvergence(
   const cugraph_resource_handle_t* handle,
   cugraph_graph_t* graph,
   double epsilon,

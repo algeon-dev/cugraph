@@ -44,15 +44,16 @@ void normalize(raft::handle_t const& handle,
 }
 
 template <typename GraphViewType, typename result_t>
-std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
-                                  GraphViewType const& graph_view,
-                                  result_t* const hubs,
-                                  result_t* const authorities,
-                                  result_t epsilon,
-                                  size_t max_iterations,
-                                  bool has_initial_hubs_guess,
-                                  bool normalize,
-                                  bool do_expensive_check)
+std::tuple<result_t, centrality_algorithm_metadata_t> hits_allow_nonconvergence(
+  raft::handle_t const& handle,
+  GraphViewType const& graph_view,
+  result_t* const hubs,
+  result_t* const authorities,
+  result_t epsilon,
+  size_t max_iterations,
+  bool has_initial_hubs_guess,
+  bool normalize,
+  bool do_expensive_check)
 {
   using vertex_t = typename GraphViewType::vertex_type;
   static_assert(std::is_integral<vertex_t>::value,
@@ -66,7 +67,10 @@ std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
   result_t diff_sum{std::numeric_limits<result_t>::max()};
   size_t final_iteration_count{max_iterations};
 
-  if (num_vertices == 0) { return std::make_tuple(diff_sum, final_iteration_count); }
+  if (num_vertices == 0) {
+    return std::make_tuple(diff_sum,
+                           centrality_algorithm_metadata_t{final_iteration_count, true});
+  }
 
   CUGRAPH_EXPECTS(epsilon >= 0.0, "Invalid input argument: epsilon should be non-negative.");
   auto tolerance = static_cast<result_t>(graph_view.number_of_vertices()) * epsilon;
@@ -105,6 +109,7 @@ std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
   }
 
   size_t iter{0};
+  bool converged{false};
   while (true) {
     // Update current destination authorities property
     per_v_transform_reduce_incoming_e(
@@ -166,10 +171,10 @@ std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
     iter++;
 
     if (diff_sum < tolerance) {
+      converged = true;
       break;
-    } else if (iter >= max_iterations) {
-      CUGRAPH_FAIL("HITS failed to converge.");
     }
+    if (iter >= max_iterations) { break; }
   }
 
   if (normalize) {
@@ -185,10 +190,33 @@ std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
                  hubs);
   }
 
-  return std::make_tuple(diff_sum, iter);
+  return std::make_tuple(diff_sum, centrality_algorithm_metadata_t{iter, converged});
 }
 
 }  // namespace detail
+
+template <typename vertex_t, typename edge_t, typename result_t, bool multi_gpu>
+std::tuple<result_t, centrality_algorithm_metadata_t> hits_allow_nonconvergence(
+  raft::handle_t const& handle,
+  graph_view_t<vertex_t, edge_t, true, multi_gpu> const& graph_view,
+  result_t* const hubs,
+  result_t* const authorities,
+  result_t epsilon,
+  size_t max_iterations,
+  bool has_initial_hubs_guess,
+  bool normalize,
+  bool do_expensive_check)
+{
+  return detail::hits_allow_nonconvergence(handle,
+                                           graph_view,
+                                           hubs,
+                                           authorities,
+                                           epsilon,
+                                           max_iterations,
+                                           has_initial_hubs_guess,
+                                           normalize,
+                                           do_expensive_check);
+}
 
 template <typename vertex_t, typename edge_t, typename result_t, bool multi_gpu>
 std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
@@ -201,15 +229,18 @@ std::tuple<result_t, size_t> hits(raft::handle_t const& handle,
                                   bool normalize,
                                   bool do_expensive_check)
 {
-  return detail::hits(handle,
-                      graph_view,
-                      hubs,
-                      authorities,
-                      epsilon,
-                      max_iterations,
-                      has_initial_hubs_guess,
-                      normalize,
-                      do_expensive_check);
+  auto [hub_score_differences, metadata] =
+    cugraph::hits_allow_nonconvergence(handle,
+                                       graph_view,
+                                       hubs,
+                                       authorities,
+                                       epsilon,
+                                       max_iterations,
+                                       has_initial_hubs_guess,
+                                       normalize,
+                                       do_expensive_check);
+  CUGRAPH_EXPECTS(metadata.converged_, "HITS failed to converge.");
+  return std::make_tuple(hub_score_differences, metadata.number_of_iterations_);
 }
 
 }  // namespace cugraph

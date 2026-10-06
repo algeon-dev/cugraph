@@ -38,4 +38,32 @@ template CUGRAPH_EXPORT void katz_centrality(
   bool normalize,
   bool do_expensive_check);
 
+template CUGRAPH_EXPORT centrality_algorithm_metadata_t katz_centrality_allow_nonconvergence(
+  raft::handle_t const& handle,
+  graph_view_t<int32_t, int32_t, true, false> const& graph_view,
+  std::optional<edge_property_view_t<int32_t, float const*>> edge_weight_view,
+  float const* betas,
+  float* katz_centralities,
+  float alpha,
+  float beta,
+  float epsilon,
+  size_t max_iterations,
+  bool has_initial_guess,
+  bool normalize,
+  bool do_expensive_check);
+
+template CUGRAPH_EXPORT centrality_algorithm_metadata_t katz_centrality_allow_nonconvergence(
+  raft::handle_t const& handle,
+  graph_view_t<int32_t, int32_t, true, false> const& graph_view,
+  std::optional<edge_property_view_t<int32_t, double const*>> edge_weight_view,
+  double const* betas,
+  double* katz_centralities,
+  double alpha,
+  double beta,
+  double epsilon,
+  size_t max_iterations,
+  bool has_initial_guess,
+  bool normalize,
+  bool do_expensive_check);
+
 }  // namespace cugraph

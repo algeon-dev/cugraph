@@ -372,6 +372,27 @@ cugraph_katz_centrality(const cugraph_resource_handle_t* handle,
                         cugraph_error_t** error);
 
 /**
+ * @brief     Compute katz centrality, reporting non-convergence in the result
+ *
+ * Takes the arguments of cugraph_katz_centrality. Instead of failing when the iteration does not
+ * converge within @p max_iterations, it returns a result whose
+ * cugraph_centrality_result_converged is false and whose values are the last iteration without
+ * normalization; a diverging iteration (an @p alpha above the inverse of the largest adjacency
+ * eigenvalue) can leave them non-finite.
+ */
+CUGRAPH_EXPORT cugraph_error_code_t
+cugraph_katz_centrality_allow_nonconvergence(const cugraph_resource_handle_t* handle,
+                                             cugraph_graph_t* graph,
+                                             const cugraph_type_erased_device_array_view_t* betas,
+                                             double alpha,
+                                             double beta,
+                                             double epsilon,
+                                             size_t max_iterations,
+                                             bool_t do_expensive_check,
+                                             cugraph_centrality_result_t** result,
+                                             cugraph_error_t** error);
+
+/**
  * @brief     Compute betweenness centrality
  *
  * Betweenness can be computed exactly by specifying vertex_list as NULL.  This will compute
@@ -551,6 +572,15 @@ CUGRAPH_EXPORT size_t cugraph_hits_result_get_number_of_iterations(cugraph_hits_
 
 /**
  * @ingroup centrality
+ * @brief     Returns true if hits converged
+ *
+ * @param [in]   result   The result from hits
+ * @return True if hits converged within its maximum iterations, false otherwise
+ */
+CUGRAPH_EXPORT bool_t cugraph_hits_result_converged(cugraph_hits_result_t* result);
+
+/**
+ * @ingroup centrality
  * @brief     Free hits result
  *
  * @param [in]   result   The result from hits
@@ -598,6 +628,25 @@ cugraph_hits(const cugraph_resource_handle_t* handle,
              bool_t do_expensive_check,
              cugraph_hits_result_t** result,
              cugraph_error_t** error);
+
+/**
+ * @brief     Compute hits, reporting non-convergence in the result
+ *
+ * Takes the arguments of cugraph_hits. Instead of failing when the iteration does not converge
+ * within @p max_iterations, it returns a result whose cugraph_hits_result_converged is false and
+ * whose scores are those of the last iteration.
+ */
+CUGRAPH_EXPORT cugraph_error_code_t cugraph_hits_allow_nonconvergence(
+  const cugraph_resource_handle_t* handle,
+  cugraph_graph_t* graph,
+  double epsilon,
+  size_t max_iterations,
+  const cugraph_type_erased_device_array_view_t* initial_hubs_guess_vertices,
+  const cugraph_type_erased_device_array_view_t* initial_hubs_guess_values,
+  bool_t normalize,
+  bool_t do_expensive_check,
+  cugraph_hits_result_t** result,
+  cugraph_error_t** error);
 
 #include <cugraph_c/export.h>
 
