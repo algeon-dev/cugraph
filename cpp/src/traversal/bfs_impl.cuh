@@ -596,7 +596,8 @@ void bfs_predicate_impl(
                                       raft::comms::op_t::SUM);
 #endif
   }
-  while (true) {
+  // depth_limit is the number of hops to expand; 0 returns only the sources.
+  while (depth < depth_limit) {
     vertex_t next_aggregate_frontier_size{};
     if (topdown) {
       topdown_pred_op_t<vertex_t, GraphViewType::is_multi_gpu, EdgePredicate, VertexPredicate>
@@ -1046,7 +1047,6 @@ void bfs_predicate_impl(
     cur_aggregate_frontier_size = next_aggregate_frontier_size;
 
     ++depth;
-    if (depth >= depth_limit) { break; }
   }
 }
 

@@ -32,6 +32,15 @@
 namespace cugraph {
 namespace c_api {
 
+// A depth limit larger than the vertex type can index never limits the traversal, because BFS
+// depth is below the vertex count. Clamp instead of letting the cast wrap.
+template <typename vertex_t>
+vertex_t clamp_depth_limit(size_t depth_limit)
+{
+  return static_cast<vertex_t>(
+    std::min(depth_limit, static_cast<size_t>(std::numeric_limits<vertex_t>::max())));
+}
+
 template <typename vertex_t, bool multi_gpu>
 size_t count_invalid_vertices(raft::handle_t const& handle,
                               rmm::device_uvector<vertex_t> const& vertices)
@@ -260,7 +269,7 @@ struct bfs_functor : public abstract_functor {
         sources.data(),
         sources.size(),
         direction_optimizing_,
-        static_cast<vertex_t>(depth_limit_),
+        clamp_depth_limit<vertex_t>(depth_limit_),
         do_expensive_check_);
 
       rmm::device_uvector<vertex_t> vertex_ids(graph_view.local_vertex_partition_range_size(),
@@ -450,7 +459,7 @@ struct bfs_predicate_functor : public abstract_functor {
           : std::nullopt,
         stop_on_first_target_,
         direction_optimizing_,
-        static_cast<vertex_t>(depth_limit_),
+        clamp_depth_limit<vertex_t>(depth_limit_),
         do_expensive_check_,
         return_predicate_result_ ? &predicate_metadata : nullptr);
 
