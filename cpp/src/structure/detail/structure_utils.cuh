@@ -233,28 +233,57 @@ sort_and_compress_edgelist(
                                              false /* edgelist_major_sorted */,
                                              large_vertex_buffer_type);
 
-    auto pivot =
-      major_range_first +
-      static_cast<vertex_t>(cuda::std::distance(
-        offsets.begin(),
-        thrust::lower_bound(
-          handle.get_thrust_policy(), offsets.begin(), offsets.end(), edgelist_minors.size() / 2)));
-    auto second_first =
+    std::array<vertex_t, 3> pivots{};
+    for (size_t i = 0; i < 3; ++i) {
+      pivots[i] =
+        major_range_first +
+        static_cast<vertex_t>(cuda::std::distance(
+          offsets.begin(),
+          thrust::lower_bound(handle.get_thrust_policy(),
+                              offsets.begin(),
+                              offsets.end(),
+                              static_cast<edge_t>((edgelist_minors.size() * (i + 1)) / 4))));
+    }
+    auto second_half_first =
       detail::mem_frugal_partition(pair_first,
                                    pair_first + edgelist_minors.size(),
                                    get_dataframe_buffer_begin(edgelist_values),
                                    thrust_tuple_get<cuda::std::tuple<vertex_t, vertex_t>, 0>{},
-                                   pivot,
+                                   pivots[1],
+                                   handle.get_stream(),
+                                   large_edge_buffer_type);
+    auto second_quarter_first =
+      detail::mem_frugal_partition(pair_first,
+                                   std::get<0>(second_half_first),
+                                   get_dataframe_buffer_begin(edgelist_values),
+                                   thrust_tuple_get<cuda::std::tuple<vertex_t, vertex_t>, 0>{},
+                                   pivots[0],
+                                   handle.get_stream(),
+                                   large_edge_buffer_type);
+    auto last_quarter_first =
+      detail::mem_frugal_partition(std::get<0>(second_half_first),
+                                   pair_first + edgelist_minors.size(),
+                                   std::get<1>(second_half_first),
+                                   thrust_tuple_get<cuda::std::tuple<vertex_t, vertex_t>, 0>{},
+                                   pivots[2],
                                    handle.get_stream(),
                                    large_edge_buffer_type);
     thrust::sort_by_key(handle.get_thrust_policy(),
                         pair_first,
-                        std::get<0>(second_first),
+                        std::get<0>(second_quarter_first),
                         get_dataframe_buffer_begin(edgelist_values));
     thrust::sort_by_key(handle.get_thrust_policy(),
-                        std::get<0>(second_first),
+                        std::get<0>(second_quarter_first),
+                        std::get<0>(second_half_first),
+                        std::get<1>(second_quarter_first));
+    thrust::sort_by_key(handle.get_thrust_policy(),
+                        std::get<0>(second_half_first),
+                        std::get<0>(last_quarter_first),
+                        std::get<1>(second_half_first));
+    thrust::sort_by_key(handle.get_thrust_policy(),
+                        std::get<0>(last_quarter_first),
                         pair_first + edgelist_minors.size(),
-                        std::get<1>(second_first));
+                        std::get<1>(last_quarter_first));
   } else {
     auto exec_policy =
       large_edge_buffer_type

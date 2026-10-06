@@ -1579,7 +1579,8 @@ create_graph_from_edgelist_impl(raft::handle_t const& handle,
        &large_edge_buffer_type](auto&& edge_property) {
         using edge_property_type = typename std::decay_t<decltype(edge_property)>::value_type;
 
-        rmm::device_uvector<edge_property_type> tmp(edgelist_srcs.size(), handle.get_stream());
+        // The returned property buffer replaces this holder after sort workspace retires.
+        rmm::device_uvector<edge_property_type> tmp(0, handle.get_stream());
         std::forward_as_tuple(offsets, indices, tmp, std::ignore) = detail::
           sort_and_compress_edgelist<vertex_t, edge_t, edge_property_type, store_transposed>(
             handle,
