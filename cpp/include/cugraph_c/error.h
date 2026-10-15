@@ -20,7 +20,8 @@ typedef enum cugraph_error_code_ {
   CUGRAPH_ALLOC_ERROR,
   CUGRAPH_INVALID_INPUT,
   CUGRAPH_NOT_IMPLEMENTED,
-  CUGRAPH_UNSUPPORTED_TYPE_COMBINATION
+  CUGRAPH_UNSUPPORTED_TYPE_COMBINATION,
+  CUGRAPH_INVALID_STATE
 } cugraph_error_code_t;
 
 typedef enum cugraph_allocation_source_ {
