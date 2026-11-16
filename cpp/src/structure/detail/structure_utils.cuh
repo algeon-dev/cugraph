@@ -41,8 +41,11 @@
 #include <thrust/transform.h>
 
 #include <algorithm>
+#include <bit>
+#include <cstdint>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 
 namespace cugraph {
 
@@ -193,6 +196,155 @@ std::tuple<rmm::device_uvector<edge_t>, rmm::device_uvector<vertex_t>> compress_
   return std::make_tuple(std::move(offsets), std::move(dcs_nzd_vertices));
 }
 
+// A packed edge key is (major - major_range_first) << minor_bits | (minor - minor_range_first).
+// Its unsigned order is the (major, minor) lexicographic order, so one radix sort replaces the
+// comparison merge sort over a two-column zip key. Both radix and merge sort are stable, which
+// keeps the input order of parallel edges and their values.
+
+// Returns minor_bits when every edge with endpoints inside the given ranges packs into one
+// uint64_t key, std::nullopt otherwise. A minor width of 64 is excluded because the major offset
+// would then be shifted by 64.
+template <typename vertex_t>
+std::optional<int> packed_edge_key_minor_bits(vertex_t major_range_first,
+                                              vertex_t major_range_last,
+                                              vertex_t minor_range_first,
+                                              vertex_t minor_range_last)
+{
+  auto offset_bits = [](size_t range_size) {
+    return range_size > 1 ? static_cast<int>(std::bit_width(range_size - 1)) : 0;
+  };
+  auto major_bits = offset_bits(static_cast<size_t>(major_range_last - major_range_first));
+  auto minor_bits = offset_bits(static_cast<size_t>(minor_range_last - minor_range_first));
+  return ((minor_bits < 64) && (major_bits + minor_bits <= 64)) ? std::make_optional(minor_bits)
+                                                                : std::nullopt;
+}
+
+template <typename vertex_t>
+struct pack_edge_key_t {
+  vertex_t major_range_first{};
+  vertex_t minor_range_first{};
+  int minor_bits{};
+
+  __device__ uint64_t operator()(vertex_t major, vertex_t minor) const
+  {
+    return (static_cast<uint64_t>(major - major_range_first) << minor_bits) |
+           static_cast<uint64_t>(minor - minor_range_first);
+  }
+};
+
+template <typename vertex_t>
+struct packed_edge_key_major_t {
+  vertex_t major_range_first{};
+  int minor_bits{};
+
+  __device__ vertex_t operator()(uint64_t key) const
+  {
+    return major_range_first + static_cast<vertex_t>(key >> minor_bits);
+  }
+};
+
+template <typename vertex_t>
+struct packed_edge_key_minor_t {
+  vertex_t minor_range_first{};
+  uint64_t minor_mask{};
+
+  __device__ vertex_t operator()(uint64_t key) const
+  {
+    return minor_range_first + static_cast<vertex_t>(key & minor_mask);
+  }
+};
+
+// mem_frugal_partition compares group IDs with an int pivot, which cannot hold every major offset,
+// so this op compares the major offset itself and returns group 0 (below the pivot) or 1.
+struct packed_edge_key_group_t {
+  uint64_t pivot_major_offset{};
+  int minor_bits{};
+
+  __device__ int operator()(uint64_t key) const
+  {
+    return (key >> minor_bits) < pivot_major_offset ? 0 : 1;
+  }
+};
+
+// 8-byte vertex IDs hold their keys in the minor buffer; 4-byte IDs need a separate key buffer.
+template <typename vertex_t>
+using packed_edge_key_buffer_t =
+  rmm::device_uvector<std::conditional_t<sizeof(vertex_t) == sizeof(uint64_t), vertex_t, uint64_t>>;
+
+template <typename T>
+uint64_t* packed_edge_key_data(rmm::device_uvector<T>& keys)
+{
+  static_assert(sizeof(T) == sizeof(uint64_t));
+  return reinterpret_cast<uint64_t*>(keys.data());
+}
+
+// Consumes both columns. For 8-byte IDs each key overwrites its own minor element (int64_t and
+// uint64_t storage may alias), so the peak is the two input columns. For 4-byte IDs the key buffer
+// coexists with both columns until they are released.
+template <typename vertex_t>
+packed_edge_key_buffer_t<vertex_t> pack_edge_keys(
+  raft::handle_t const& handle,
+  rmm::device_uvector<vertex_t>&& majors,
+  rmm::device_uvector<vertex_t>&& minors,
+  vertex_t major_range_first,
+  vertex_t minor_range_first,
+  int minor_bits,
+  std::optional<large_buffer_type_t> large_edge_buffer_type)
+{
+  pack_edge_key_t<vertex_t> pack{major_range_first, minor_range_first, minor_bits};
+  if constexpr (sizeof(vertex_t) == sizeof(uint64_t)) {
+    thrust::transform(handle.get_thrust_policy(),
+                      majors.begin(),
+                      majors.end(),
+                      minors.begin(),
+                      packed_edge_key_data(minors),
+                      pack);
+    majors.resize(0, handle.get_stream());
+    majors.shrink_to_fit(handle.get_stream());
+    return std::move(minors);
+  } else {
+    auto keys =
+      large_edge_buffer_type
+        ? large_buffer_manager::allocate_memory_buffer<uint64_t>(majors.size(), handle.get_stream())
+        : rmm::device_uvector<uint64_t>(majors.size(), handle.get_stream());
+    thrust::transform(
+      handle.get_thrust_policy(), majors.begin(), majors.end(), minors.begin(), keys.begin(), pack);
+    majors.resize(0, handle.get_stream());
+    majors.shrink_to_fit(handle.get_stream());
+    minors.resize(0, handle.get_stream());
+    minors.shrink_to_fit(handle.get_stream());
+    return keys;
+  }
+}
+
+// Consumes the sorted keys and returns the minors. 8-byte IDs are unpacked in place.
+template <typename vertex_t>
+rmm::device_uvector<vertex_t> unpack_edge_key_minors(
+  raft::handle_t const& handle,
+  packed_edge_key_buffer_t<vertex_t>&& keys,
+  vertex_t minor_range_first,
+  int minor_bits,
+  std::optional<large_buffer_type_t> large_edge_buffer_type)
+{
+  auto key_first = packed_edge_key_data(keys);
+  packed_edge_key_minor_t<vertex_t> unpack{minor_range_first, (uint64_t{1} << minor_bits) - 1};
+  if constexpr (sizeof(vertex_t) == sizeof(uint64_t)) {
+    thrust::transform(
+      handle.get_thrust_policy(), key_first, key_first + keys.size(), keys.begin(), unpack);
+    return std::move(keys);
+  } else {
+    auto minors =
+      large_edge_buffer_type
+        ? large_buffer_manager::allocate_memory_buffer<vertex_t>(keys.size(), handle.get_stream())
+        : rmm::device_uvector<vertex_t>(keys.size(), handle.get_stream());
+    thrust::transform(
+      handle.get_thrust_policy(), key_first, key_first + keys.size(), minors.begin(), unpack);
+    keys.resize(0, handle.get_stream());
+    keys.shrink_to_fit(handle.get_stream());
+    return minors;
+  }
+}
+
 // compress edge list (COO) to CSR (or CSC) or CSR + DCSR (CSC + DCSC) hybrid
 template <typename vertex_t, typename edge_t, typename edge_value_t, bool store_transposed>
 std::tuple<rmm::device_uvector<edge_t>,
@@ -207,8 +359,8 @@ sort_and_compress_edgelist(
   vertex_t major_range_first,
   std::optional<vertex_t> major_hypersparse_first,
   vertex_t major_range_last,
-  vertex_t /* minor_range_first */,
-  vertex_t /* minor_range_last */,
+  vertex_t minor_range_first,
+  vertex_t minor_range_last,
   size_t mem_frugal_threshold,
   std::optional<large_buffer_type_t> large_vertex_buffer_type = std::nullopt,
   std::optional<large_buffer_type_t> large_edge_buffer_type   = std::nullopt)
@@ -224,7 +376,100 @@ sort_and_compress_edgelist(
   rmm::device_uvector<vertex_t> indices(0, handle.get_stream());
   auto values     = allocate_dataframe_buffer<edge_value_t>(0, handle.get_stream());
   auto pair_first = thrust::make_zip_iterator(edgelist_majors.begin(), edgelist_minors.begin());
-  if (edgelist_minors.size() > mem_frugal_threshold) {
+  auto const minor_bits = packed_edge_key_minor_bits(
+    major_range_first, major_range_last, minor_range_first, minor_range_last);
+  // With 4-byte IDs, the frugal branch keeps both columns live while it sorts a quarter, and a
+  // packed key buffer plus its radix copy add 16 bytes per sorted edge where the merge sort adds 8,
+  // so that branch keeps the merge sort.
+  if (minor_bits && ((sizeof(vertex_t) == sizeof(uint64_t)) ||
+                     (edgelist_minors.size() <= mem_frugal_threshold))) {
+    auto keys        = pack_edge_keys(handle,
+                               std::move(edgelist_majors),
+                               std::move(edgelist_minors),
+                               major_range_first,
+                               minor_range_first,
+                               *minor_bits,
+                               large_edge_buffer_type);
+    auto key_first   = packed_edge_key_data(keys);
+    auto key_last    = key_first + keys.size();
+    auto major_first = cuda::make_transform_iterator(
+      key_first, packed_edge_key_major_t<vertex_t>{major_range_first, *minor_bits});
+    auto value_first = get_dataframe_buffer_begin(edgelist_values);
+    if (keys.size() > mem_frugal_threshold) {
+      // Same quarter partitioning as the zip-key branch below: values move with their keys, and
+      // each sort's workspace covers about a quarter of the edges.
+      offsets = compute_sparse_offsets<edge_t>(handle,
+                                               major_first,
+                                               major_first + keys.size(),
+                                               major_range_first,
+                                               major_range_last,
+                                               false /* edgelist_major_sorted */,
+                                               large_vertex_buffer_type);
+      std::array<uint64_t, 3> pivots{};
+      for (size_t i = 0; i < 3; ++i) {
+        pivots[i] = static_cast<uint64_t>(cuda::std::distance(
+          offsets.begin(),
+          thrust::lower_bound(handle.get_thrust_policy(),
+                              offsets.begin(),
+                              offsets.end(),
+                              static_cast<edge_t>((keys.size() * (i + 1)) / 4))));
+      }
+      auto second_half_first =
+        detail::mem_frugal_partition(key_first,
+                                     key_last,
+                                     value_first,
+                                     packed_edge_key_group_t{pivots[1], *minor_bits},
+                                     1,
+                                     handle.get_stream(),
+                                     large_edge_buffer_type);
+      auto second_quarter_first =
+        detail::mem_frugal_partition(key_first,
+                                     std::get<0>(second_half_first),
+                                     value_first,
+                                     packed_edge_key_group_t{pivots[0], *minor_bits},
+                                     1,
+                                     handle.get_stream(),
+                                     large_edge_buffer_type);
+      auto last_quarter_first =
+        detail::mem_frugal_partition(std::get<0>(second_half_first),
+                                     key_last,
+                                     std::get<1>(second_half_first),
+                                     packed_edge_key_group_t{pivots[2], *minor_bits},
+                                     1,
+                                     handle.get_stream(),
+                                     large_edge_buffer_type);
+      thrust::sort_by_key(
+        handle.get_thrust_policy(), key_first, std::get<0>(second_quarter_first), value_first);
+      thrust::sort_by_key(handle.get_thrust_policy(),
+                          std::get<0>(second_quarter_first),
+                          std::get<0>(second_half_first),
+                          std::get<1>(second_quarter_first));
+      thrust::sort_by_key(handle.get_thrust_policy(),
+                          std::get<0>(second_half_first),
+                          std::get<0>(last_quarter_first),
+                          std::get<1>(second_half_first));
+      thrust::sort_by_key(handle.get_thrust_policy(),
+                          std::get<0>(last_quarter_first),
+                          key_last,
+                          std::get<1>(last_quarter_first));
+    } else {
+      auto exec_policy =
+        large_edge_buffer_type
+          ? rmm::exec_policy_nosync(handle.get_stream(), large_buffer_manager::memory_buffer_mr())
+          : handle.get_thrust_policy();
+      thrust::sort_by_key(exec_policy, key_first, key_last, value_first);
+
+      offsets = compute_sparse_offsets<edge_t>(handle,
+                                               major_first,
+                                               major_first + keys.size(),
+                                               major_range_first,
+                                               major_range_last,
+                                               true /* edgelist_major_sorted */,
+                                               large_vertex_buffer_type);
+    }
+    edgelist_minors = unpack_edge_key_minors(
+      handle, std::move(keys), minor_range_first, *minor_bits, large_edge_buffer_type);
+  } else if (edgelist_minors.size() > mem_frugal_threshold) {
     offsets = compute_sparse_offsets<edge_t>(handle,
                                              edgelist_majors.begin(),
                                              edgelist_majors.end(),
@@ -334,8 +579,8 @@ sort_and_compress_edgelist(
   vertex_t major_range_first,
   std::optional<vertex_t> major_hypersparse_first,
   vertex_t major_range_last,
-  vertex_t /* minor_range_first */,
-  vertex_t /* minor_range_last */,
+  vertex_t minor_range_first,
+  vertex_t minor_range_last,
   size_t mem_frugal_threshold,
   std::optional<large_buffer_type_t> large_vertex_buffer_type = std::nullopt,
   std::optional<large_buffer_type_t> large_edge_buffer_type   = std::nullopt)
@@ -345,7 +590,39 @@ sort_and_compress_edgelist(
 
   rmm::device_uvector<edge_t> offsets(0, handle.get_stream());
   rmm::device_uvector<vertex_t> indices(0, handle.get_stream());
-  if (edgelist_minors.size() > mem_frugal_threshold) {
+  auto const minor_bits = packed_edge_key_minor_bits(
+    major_range_first, major_range_last, minor_range_first, minor_range_last);
+  // 8-byte keys packed in place sort within the input columns' footprint, so quarter partitioning
+  // cannot lower the peak. With 4-byte IDs, the frugal branch keeps both columns live while it
+  // sorts a quarter, and a packed key buffer plus its radix copy add 16 bytes per sorted edge where
+  // the merge sort adds 8, so that branch keeps the merge sort.
+  if (minor_bits && ((sizeof(vertex_t) == sizeof(uint64_t)) ||
+                     (edgelist_minors.size() <= mem_frugal_threshold))) {
+    auto keys      = pack_edge_keys(handle,
+                               std::move(edgelist_majors),
+                               std::move(edgelist_minors),
+                               major_range_first,
+                               minor_range_first,
+                               *minor_bits,
+                               large_edge_buffer_type);
+    auto key_first = packed_edge_key_data(keys);
+    auto exec_policy =
+      large_edge_buffer_type
+        ? rmm::exec_policy_nosync(handle.get_stream(), large_buffer_manager::memory_buffer_mr())
+        : handle.get_thrust_policy();
+    cugraph::sort(exec_policy, key_first, key_first + keys.size());
+    auto major_first = cuda::make_transform_iterator(
+      key_first, packed_edge_key_major_t<vertex_t>{major_range_first, *minor_bits});
+    offsets         = compute_sparse_offsets<edge_t>(handle,
+                                             major_first,
+                                             major_first + keys.size(),
+                                             major_range_first,
+                                             major_range_last,
+                                             true,
+                                             large_vertex_buffer_type);
+    edgelist_minors = unpack_edge_key_minors(
+      handle, std::move(keys), minor_range_first, *minor_bits, large_edge_buffer_type);
+  } else if (edgelist_minors.size() > mem_frugal_threshold) {
     static_assert((sizeof(vertex_t) == 4) || (sizeof(vertex_t) == 8));
     if ((sizeof(vertex_t) == 8) && (static_cast<size_t>(major_range_last - major_range_first) <=
                                     static_cast<size_t>(std::numeric_limits<uint32_t>::max()))) {
