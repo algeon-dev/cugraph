@@ -620,6 +620,11 @@ graph_view_t<vertex_t, edge_t, store_transposed, multi_gpu, std::enable_if_t<mul
                                  this->partition_,
                                  this->edge_partition_segment_offsets_);
   } else {
+    // In a symmetric graph every vertex's in-degree equals its out-degree, which the major offsets
+    // give without a pass over the edges. An edge mask need not keep the graph symmetric.
+    if (this->is_symmetric() && !this->has_edge_mask()) {
+      return this->compute_out_degrees(handle);
+    }
     return compute_minor_degrees(handle, *this);
   }
 }
@@ -639,6 +644,11 @@ graph_view_t<vertex_t, edge_t, store_transposed, multi_gpu, std::enable_if_t<!mu
                                    : std::nullopt,
                                  this->local_vertex_partition_range_size());
   } else {
+    // In a symmetric graph every vertex's in-degree equals its out-degree, which the major offsets
+    // give without a pass over the edges. An edge mask need not keep the graph symmetric.
+    if (this->is_symmetric() && !this->has_edge_mask()) {
+      return this->compute_out_degrees(handle);
+    }
     return compute_minor_degrees(handle, *this);
   }
 }
@@ -649,6 +659,9 @@ graph_view_t<vertex_t, edge_t, store_transposed, multi_gpu, std::enable_if_t<mul
   compute_out_degrees(raft::handle_t const& handle) const
 {
   if (store_transposed) {
+    // In a symmetric graph every vertex's out-degree equals its in-degree, which the major offsets
+    // give without a pass over the edges. An edge mask need not keep the graph symmetric.
+    if (this->is_symmetric() && !this->has_edge_mask()) { return this->compute_in_degrees(handle); }
     return compute_minor_degrees(handle, *this);
   } else {
     std::optional<std::vector<raft::device_span<uint32_t const>>> edge_partition_masks{
@@ -678,6 +691,9 @@ graph_view_t<vertex_t, edge_t, store_transposed, multi_gpu, std::enable_if_t<!mu
   compute_out_degrees(raft::handle_t const& handle) const
 {
   if (store_transposed) {
+    // In a symmetric graph every vertex's out-degree equals its in-degree, which the major offsets
+    // give without a pass over the edges. An edge mask need not keep the graph symmetric.
+    if (this->is_symmetric() && !this->has_edge_mask()) { return this->compute_in_degrees(handle); }
     return compute_minor_degrees(handle, *this);
   } else {
     return compute_major_degrees(handle,
